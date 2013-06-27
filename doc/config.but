@@ -1904,9 +1904,10 @@ PuTTY will prompt for a username at the time you make a connection.
 In some environments, such as the networks of large organisations
 implementing \i{single sign-on}, a more sensible default may be to use
 the name of the user logged in to the local operating system (if any);
-this is particularly likely to be useful with \i{GSSAPI} authentication
-(see \k{config-ssh-auth-gssapi}). This control allows you to change
-the default behaviour.
+this is particularly likely to be useful with \i{GSSAPI} key exchange
+and user authentication (see \k{config-ssh-auth-gssapi} and
+\k{config-ssh-kex}). This control allows you to change the default
+behaviour.
 
 The current system username is displayed in the dialog as a
 convenience. It is not saved in the configuration; if a saved session
@@ -2500,7 +2501,24 @@ PuTTY supports a variety of SSH-2 key exchange methods, and allows you
 to choose which one you prefer to use; configuration is similar to
 cipher selection (see \k{config-ssh-encryption}).
 
-PuTTY currently supports the following key exchange methods:
+PuTTY supports the use of \i{GSSAPI authenticated key exchange}, with
+Diffie-Hellman, with all the Diffie-Hellman group choices (1, 14, and
+group exchange) as are available for hostkey authenticated
+Diffie-Hellman key exchange.  Currently only the Kerberos V5 GSSAPI
+mechanism is supported for GSSAPI authenticated key exchange.  The
+GSSAPI key exchange algorithms are only offered when the user has
+credentials for it.  Users who wish to use GSSAPI authenticated key
+exchange should place these key exchange algorithms ahead of all others.
+
+GSSAPI key exchange and authentication can be configured separately.
+
+\S{config-ssh-kex-gssapi-delegation} \q{Allow GSSAPI credential
+delegation during key exchange}
+
+\cfg{winhelp-topic}{ssh.kex.gssapi.delegation}
+
+PuTTY currently supports the following varieties of \i{Diffie-Hellman key
+exchange}:
 
 \b \q{ECDH}: \i{elliptic curve} \i{Diffie-Hellman key exchange}.
 
@@ -2519,9 +2537,10 @@ invent new ones over time, without any changes required to PuTTY's
 configuration. We recommend use of this method instead of the
 well-known groups, if possible.
 
-\b \q{\i{RSA key exchange}}: this requires much less computational
-effort on the part of the client, and somewhat less on the part of
-the server, than Diffie-Hellman key exchange.
+In addition, PuTTY supports \i{RSA key exchange}, which requires much less
+computational effort on the part of the client, and somewhat less on
+the part of the server, than Diffie-Hellman key exchange.  Note that RSA
+key exchange does not provide forward security.
 
 If the first algorithm PuTTY finds is below the \q{warn below here}
 line, you will see a warning box when you make the connection, similar
@@ -2568,6 +2587,13 @@ purposes, rekeys have much the same properties as keepalives.
 (Except that rekeys have cryptographic value in themselves, so you
 should bear that in mind when deciding whether to turn them off.)
 Note, however, the the SSH \e{server} can still initiate rekeys.
+
+\b \q{Minutes between GSSAPI cache checks} specifies how often the GSSAPI
+credential cache is checked to see whether new tickets are available
+for delegation, or current ones are near expiration.  If forwarding of
+credentials is enabled, Putty will try to rekey as necessary to keep the
+delegated credentials from expiring.  Frequent checks are recommended,
+rekeying only happens when needed.
 
 \b \q{Max data before rekey} specifies the amount of data (in bytes)
 that is permitted to flow in either direction before a rekey is
@@ -2922,7 +2948,11 @@ machine, which in principle can authenticate in many different ways
 but in practice is usually used with the \i{Kerberos} \i{single sign-on}
 protocol to implement \i{passwordless login}.
 
-GSSAPI is only available in the SSH-2 protocol.
+GSSAPI authentication is only available in the SSH-2 protocol.
+
+Both, "gssapi-with-mic" and "gssapi-keyex" are supported.  If GSSAPI
+authentication is enabled and GSSAPI key exchange was used then
+"gssapi-keyex" will be attempted.
 
 The topmost control on the GSSAPI subpanel is the checkbox labelled
 \q{Attempt GSSAPI authentication}. If this is disabled, GSSAPI will
@@ -2968,11 +2998,11 @@ method to be accessed through the same interface. Therefore, more
 than one authentication library may exist on your system which can
 be accessed using GSSAPI.
 
-PuTTY contains native support for a few well-known such libraries,
-and will look for all of them on your system and use whichever it
-finds. If more than one exists on your system and you need to use a
-specific one, you can adjust the order in which it will search using
-this preference list control.
+PuTTY contains native support for a few well-known such libraries
+(including Windows' SSPI), and will look for all of them on your system
+and use whichever it finds. If more than one exists on your system and
+you need to use a specific one, you can adjust the order in which it
+will search using this preference list control.
 
 One of the options in the preference list is to use a user-specified
 GSSAPI library. If the library you want to use is not mentioned by

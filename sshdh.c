@@ -115,6 +115,34 @@ const struct ssh_kexes ssh_diffiehellman_gex = {
     gex_list
 };
 
+#define k5 "toWM5Slw5Ew8Mqkay+al2g=="
+
+static const struct ssh_kex ssh_gssk5_diffiehellman_gex_sha1 = {
+    "gss-gex-sha1-" k5, NULL,
+    KEXTYPE_GSS, &ssh_sha1, &extra_gex,
+};
+
+static const struct ssh_kex ssh_gssk5_diffiehellman_group14_sha1 = {
+    "gss-group14-sha1-" k5, "group14",
+    KEXTYPE_GSS, &ssh_sha1, &extra_group14,
+};
+
+static const struct ssh_kex ssh_gssk5_diffiehellman_group1_sha1 = {
+    "gss-group1-sha1-" k5, "group1",
+    KEXTYPE_GSS, &ssh_sha1, &extra_group1,
+};
+
+static const struct ssh_kex *const gssk5_sha1_kex_list[] = {
+    &ssh_gssk5_diffiehellman_gex_sha1,
+    &ssh_gssk5_diffiehellman_group14_sha1,
+    &ssh_gssk5_diffiehellman_group1_sha1
+};
+
+const struct ssh_kexes ssh_gssk5_sha1_kex = {
+    sizeof(gssk5_sha1_kex_list) / sizeof(*gssk5_sha1_kex_list),
+    gssk5_sha1_kex_list
+};
+
 /*
  * Variables.
  */

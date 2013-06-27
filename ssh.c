@@ -17,6 +17,12 @@
 #ifndef NO_GSSAPI
 #include "sshgssc.h"
 #include "sshgss.h"
+#define GSS_DEF_REKEY_MINS 2	/* Default minutes between GSS cache checks */
+#define MIN_CTXT_LIFETIME 5	/* Avoid rekey with short lifetime (seconds) */
+#define GSS_KEX_CAPABLE	(1<<0)	/* Can do GSS KEX */
+#define GSS_CRED_UPDATED (1<<1) /* Cred updated since previous delegation */
+#define GSS_CTXT_EXPIRES (1<<2)	/* Context expires before next timer */
+#define GSS_CTXT_MAYFAIL (1<<3)	/* Context may expire during handshake */
 #endif
 
 #ifndef FALSE
@@ -35,6 +41,7 @@ typedef enum {
     SSH2_PKTCTX_DHGROUP,
     SSH2_PKTCTX_DHGEX,
     SSH2_PKTCTX_ECDHKEX,
+    SSH2_PKTCTX_GSSKEX,
     SSH2_PKTCTX_RSAKEX
 } Pkt_KCtx;
 typedef enum {
@@ -189,6 +196,14 @@ static unsigned int ssh_tty_parse_boolean(char *s)
 	return (atoi(s) != 0);
 }
 
+/* Safely convert rekey_time to unsigned long minutes */
+static unsigned long rekey_mins(int rekey_time, unsigned long def)
+{
+    if (rekey_time < 0 || rekey_time > MAX_TICK_MINS)
+	rekey_time = def;
+    return (unsigned long)rekey_time;
+}
+
 #define translate(x) if (type == x) return #x
 #define translatek(x,ctx) if (type == x && (pkt_kctx == ctx)) return #x
 #define translatea(x,ctx) if (type == x && (pkt_actx == ctx)) return #x
@@ -266,6 +281,13 @@ static const char *ssh2_pkt_type(Pkt_KCtx pkt_kctx, Pkt_ACtx pkt_actx,
     translatek(SSH2_MSG_KEXRSA_DONE, SSH2_PKTCTX_RSAKEX);
     translatek(SSH2_MSG_KEX_ECDH_INIT, SSH2_PKTCTX_ECDHKEX);
     translatek(SSH2_MSG_KEX_ECDH_REPLY, SSH2_PKTCTX_ECDHKEX);
+    translatek(SSH2_MSG_KEXGSS_INIT, SSH2_PKTCTX_GSSKEX);
+    translatek(SSH2_MSG_KEXGSS_CONTINUE, SSH2_PKTCTX_GSSKEX);
+    translatek(SSH2_MSG_KEXGSS_COMPLETE, SSH2_PKTCTX_GSSKEX);
+    translatek(SSH2_MSG_KEXGSS_HOSTKEY, SSH2_PKTCTX_GSSKEX);
+    translatek(SSH2_MSG_KEXGSS_ERROR, SSH2_PKTCTX_GSSKEX);
+    translatek(SSH2_MSG_KEXGSS_GROUPREQ, SSH2_PKTCTX_GSSKEX);
+    translatek(SSH2_MSG_KEXGSS_GROUP, SSH2_PKTCTX_GSSKEX);
     translate(SSH2_MSG_USERAUTH_REQUEST);
     translate(SSH2_MSG_USERAUTH_FAILURE);
     translate(SSH2_MSG_USERAUTH_SUCCESS);
@@ -722,6 +744,10 @@ static unsigned long ssh_pkt_getuint32(struct Packet *pkt);
 static int ssh2_pkt_getbool(struct Packet *pkt);
 static void ssh_pkt_getstring(struct Packet *pkt, char **p, int *length);
 static void ssh2_timer(void *ctx, unsigned long now);
+static int ssh2_timer_update(Ssh ssh, unsigned long rekey_time);
+static void ssh2_gss_update(Ssh ssh);
+static struct Packet *ssh2_gss_authpacket(Ssh ssh, Ssh_gss_ctx gss_ctx,
+					  const char *authtype);
 static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 			      struct Packet *pktin);
 static void ssh2_msg_unexpected(Ssh ssh, struct Packet *pktin);
@@ -960,11 +986,27 @@ struct ssh_tag {
      */
     char *fullhostname;
 
+    /*
+     * Always on if/when enabled initially.
+     */
+    int null_hostkey_alg_ok;
+
 #ifndef NO_GSSAPI
     /*
-     * GSSAPI libraries for this session.
+     * GSSAPI libraries for this session.  We need them at key exchange
+     * and userauth time.
+     *
+     * And the gss_ctx we setup at initial key exchange will be used
+     * during gssapi-keyex userauth time as well.
      */
     struct ssh_gss_liblist *gsslibs;
+    struct ssh_gss_library *gsslib;
+    int gss_status;
+    int initial_used_gss;
+    time_t gss_cred_expiry;		/* Re-delegate if newer */
+    unsigned long gss_ctxt_lifetime;	/* Re-delegate when short */
+    Ssh_gss_name gss_srv_name;		/* Cached for KEXGSS */
+    Ssh_gss_ctx gss_ctx;		/* Saved for gssapi-keyex */
 #endif
 
     /*
@@ -4207,7 +4249,7 @@ static int do_ssh1_login(Ssh ssh, const unsigned char *in, int inlen,
             ssh_set_frozen(ssh, 1);
             s->dlgret = verify_ssh_host_key(ssh->frontend,
                                             ssh->savedhost, ssh->savedport,
-                                            "rsa", keystr, fingerprint,
+                                            "rsa", keystr, fingerprint, 0,
                                             ssh_dialog_callback, ssh);
             sfree(keystr);
 #ifdef FUZZING
@@ -6324,11 +6366,14 @@ static struct kexinit_algorithm *ssh2_kexinit_addalg(struct kexinit_algorithm
 {
     int i;
 
-    for (i = 0; i < MAXKEXLIST; i++)
-	if (list[i].name == NULL || list[i].name == name) {
-	    list[i].name = name;
+    for (i = 0; i < MAXKEXLIST; i++) {
+	if (list[i].name == name)
 	    return &list[i];
-	}
+        if (list[i].name == NULL) {
+            list[i].name = name;
+	    return &list[i];
+        }
+    }
     assert(!"No space in KEXINIT list");
     return NULL;
 }
@@ -6374,6 +6419,7 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
         void *eckey;                   /* for ECDH kex */
 	unsigned char exchange_hash[SSH2_KEX_MAX_HASH_LEN];
 	int n_preferred_kex;
+	int can_gssapi_keyex;
 	const struct ssh_kexes *preferred_kex[KEX_MAX];
 	int n_preferred_hk;
 	int preferred_hk[HK_MAX];
@@ -6388,6 +6434,17 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 	int guessok;
 	int ignorepkt;
 	struct kexinit_algorithm kexlists[NKEXLIST][MAXKEXLIST];
+#ifndef NO_GSSAPI
+	Ssh_gss_buf gss_buf;
+	Ssh_gss_buf gss_rcvtok, gss_sndtok;
+	Ssh_gss_stat gss_stat;
+	Ssh_gss_ctx gss_ctx;
+	Ssh_gss_buf mic;
+	int init_token_sent;
+	int complete_rcvd;
+	int gss_delegate;
+	time_t gss_cred_expiry;
+#endif
     };
     crState(do_ssh2_transport_state);
 
@@ -6400,6 +6457,8 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
     s->csmac_tobe = s->scmac_tobe = NULL;
     s->cscomp_tobe = s->sccomp_tobe = NULL;
 
+    s->keystr = NULL;
+    s->hkey = NULL;
     s->got_session_id = s->activated_authconn = FALSE;
     s->userauth_succeeded = FALSE;
     s->pending_compression = FALSE;
@@ -6413,6 +6472,40 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 	s->maclist = macs, s->nmacs = lenof(macs);
 
   begin_key_exchange:
+
+#ifndef NO_GSSAPI
+    /*
+     * We always check if we have GSS creds before we come up with the
+     * kex algorithm list, otherwise future rekeys will fail when creds
+     * expire.  To make this so, this code section must follow the
+     * begin_key_exchange label above, otherwise this section would
+     * execute just once per-connection.
+     *
+     * Update GSS state unless the reason we're here is that a timer just
+     * checked the GSS state and decided that we should rekey to update
+     * delegated credentials.  In that case, the state is "fresh".
+     */
+    if (!vin || strcmp(vin, "gssupdate") != 0)
+	ssh2_gss_update(ssh);
+
+    /* Do GSSAPI KEY when capable */
+    s->can_gssapi_keyex = ssh->gss_status & GSS_KEX_CAPABLE;
+
+    /*
+     * But not when failure is likely.  [ GSS implementations may attempt (and
+     * fail) to use a ticket that is almost expired when retrieved from the
+     * ccache that actually expires by the time the server receives it. ]
+     *
+     * Note: The first time always try KEXGSS if we can, failures will be very
+     * rare, and disabling the initial GSS KEX is worse.  Some day GSS libraries
+     * will ignore cached tickets whose lifetime is critically short, and will
+     * instead use fresh ones.
+     */
+    if (!s->got_session_id && (ssh->gss_status & GSS_CTXT_MAYFAIL) != 0)
+	s->can_gssapi_keyex = 0;
+    s->gss_delegate = conf_get_int(ssh->conf, CONF_gssapifwd);
+#endif
+
     ssh->pkt_kctx = SSH2_PKTCTX_NOKEX;
     {
 	int i, j, k, warn;
@@ -6422,7 +6515,9 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 	 * Set up the preferred key exchange. (NULL => warn below here)
 	 */
 	s->n_preferred_kex = 0;
-	for (i = 0; i < KEX_MAX; i++) {
+        if (s->can_gssapi_keyex)
+            s->preferred_kex[s->n_preferred_kex++] = &ssh_gssk5_sha1_kex;
+	for (i = 0; i < KEX_MAX_CONF; i++) {
 	    switch (conf_get_int_int(ssh->conf, CONF_ssh_kexlist, i)) {
 	      case KEX_DHGEX:
 		s->preferred_kex[s->n_preferred_kex++] =
@@ -6538,62 +6633,58 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 		alg->u.kex.warn = warn;
 	    }
 	}
-	/* List server host key algorithms. */
-        if (!s->got_session_id) {
-            /*
-             * In the first key exchange, we list all the algorithms
-             * we're prepared to cope with, but prefer those algorithms
-	     * for which we have a host key for this host.
-             *
-             * If the host key algorithm is below the warning
-             * threshold, we warn even if we did already have a key
-             * for it, on the basis that if the user has just
-             * reconfigured that host key type to be warned about,
-             * they surely _do_ want to be alerted that a server
-             * they're actually connecting to is using it.
-             */
-            warn = FALSE;
-            for (i = 0; i < s->n_preferred_hk; i++) {
-                if (s->preferred_hk[i] == HK_WARN)
-                    warn = TRUE;
-                for (j = 0; j < lenof(hostkey_algs); j++) {
-                    if (hostkey_algs[j].id != s->preferred_hk[i])
-                        continue;
-                    if (have_ssh_host_key(ssh->savedhost, ssh->savedport,
-                                          hostkey_algs[j].alg->keytype)) {
-                        alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
-                                                  hostkey_algs[j].alg->name);
-                        alg->u.hk.hostkey = hostkey_algs[j].alg;
-                        alg->u.hk.warn = warn;
-                    }
-                }
-	    }
-            warn = FALSE;
-            for (i = 0; i < s->n_preferred_hk; i++) {
-                if (s->preferred_hk[i] == HK_WARN)
-                    warn = TRUE;
-                for (j = 0; j < lenof(hostkey_algs); j++) {
-                    if (hostkey_algs[j].id != s->preferred_hk[i])
-                        continue;
+	/*
+         * List server host key algorithms.
+         *
+         * On initial key exchange we prefer those algorithms for which we have
+         * a host key for this host.  On rekeys we allow host key upgrades
+         * without prompting since the host is already authenticated.  This
+         * makes it possible to smoothly transition to stronger host keys.
+         *
+         * XXX: On initial kex if warned, don't later silently store new
+         * host keys.
+         *
+         * If the host key algorithm is below the warning threshold, we warn
+         * even if we did already have a key for it, on the basis that if the
+         * user has just reconfigured that host key type to be warned about,
+         * they surely _do_ want to be alerted that a server they're actually
+         * connecting to is using it.
+         *
+         * Note: there's no need to warn about hostkey algorithms when
+         * rekeying, the initial host authentication is sufficient.
+         */
+        warn = FALSE;
+        for (i = 0; i < s->n_preferred_hk && !s->got_session_id; i++) {
+            if (s->preferred_hk[i] == HK_WARN)
+                warn = TRUE;
+            for (j = 0; j < lenof(hostkey_algs); j++) {
+                if (hostkey_algs[j].id != s->preferred_hk[i])
+                    continue;
+                if (have_ssh_host_key(ssh->savedhost, ssh->savedport,
+                                      hostkey_algs[j].alg->keytype)) {
                     alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
                                               hostkey_algs[j].alg->name);
                     alg->u.hk.hostkey = hostkey_algs[j].alg;
                     alg->u.hk.warn = warn;
                 }
             }
-        } else {
-            /*
-             * In subsequent key exchanges, we list only the kex
-             * algorithm that was selected in the first key exchange,
-             * so that we keep getting the same host key and hence
-             * don't have to interrupt the user's session to ask for
-             * reverification.
-             */
-            assert(ssh->kex);
-	    alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
-				      ssh->hostkey->name);
-	    alg->u.hk.hostkey = ssh->hostkey;
-            alg->u.hk.warn = FALSE;
+        }
+        warn = FALSE;
+        for (i = 0; i < s->n_preferred_hk; i++) {
+            if (s->preferred_hk[i] == HK_WARN && !s->got_session_id)
+                warn = TRUE;
+            for (j = 0; j < lenof(hostkey_algs); j++) {
+                if (hostkey_algs[j].id != s->preferred_hk[i])
+                    continue;
+                alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
+                                          hostkey_algs[j].alg->name);
+                alg->u.hk.hostkey = hostkey_algs[j].alg;
+                alg->u.hk.warn = warn;
+            }
+        }
+        if (s->can_gssapi_keyex || ssh->null_hostkey_alg_ok) {
+            alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY], "null");
+            alg->u.hk.hostkey = NULL;
         }
 	/* List encryption algorithms (client->server then server->client). */
 	for (k = KEXLIST_CSCIPHER; k <= KEXLIST_SCCIPHER; k++) {
@@ -6726,6 +6817,8 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 		bombout(("KEXINIT packet was incomplete"));
 		crStopV;
 	    }
+            logeventf(ssh, "Server offered these %s algorithms: %.*s",
+                      kexlist_descr[i], len, str);
 
             /* If we've already selected a cipher which requires a
              * particular MAC, then just select that, and don't even
@@ -6759,6 +6852,16 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 			ssh->kex = alg->u.kex.kex;
 			s->warn_kex = alg->u.kex.warn;
 		    } else if (i == KEXLIST_HOSTKEY) {
+                        /*
+                         * Ignore an unexpected/inappropriate offer of "null",
+                         * we offer "null" when we're willing to, or previously
+                         * did GSSKEX, but it is only acceptable when GSSKEX is
+                         * now or was previously selected.
+                         */
+                        if (alg->u.hk.hostkey == NULL &&
+                            ssh->kex->main_type != KEXTYPE_GSS &&
+                            !ssh->null_hostkey_alg_ok)
+                            continue;
 			ssh->hostkey = alg->u.hk.hostkey;
                         s->warn_hk = alg->u.hk.warn;
 		    } else if (i == KEXLIST_CSCIPHER) {
@@ -7067,20 +7170,22 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
         }
         set_busy_status(ssh->frontend, BUSY_CPU); /* cogitate */
         ssh_pkt_getstring(pktin, &s->hostkeydata, &s->hostkeylen);
-        if (!s->hostkeydata) {
-            bombout(("unable to parse key exchange reply packet"));
+
+        if (s->hostkeydata) {
+            s->hkey = ssh->hostkey->newkey(ssh->hostkey,
+                                           s->hostkeydata, s->hostkeylen);
+        } else if (!ssh->null_hostkey_alg_ok) {
+            bombout(("unexpected null host key"));
             crStopV;
         }
-        s->hkey = ssh->hostkey->newkey(ssh->hostkey,
-                                       s->hostkeydata, s->hostkeylen);
         s->f = ssh2_pkt_getmp(pktin);
         if (!s->f) {
             bombout(("unable to parse key exchange reply packet"));
             crStopV;
         }
         ssh_pkt_getstring(pktin, &s->sigdata, &s->siglen);
-        if (!s->sigdata) {
-            bombout(("unable to parse key exchange reply packet"));
+        if (!s->sigdata && !ssh->null_hostkey_alg_ok) {
+            bombout(("unexpected empty host key signature"));
             crStopV;
         }
 
@@ -7154,13 +7259,15 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
         }
 
         ssh_pkt_getstring(pktin, &s->hostkeydata, &s->hostkeylen);
-        if (!s->hostkeydata) {
-            bombout(("unable to parse ECDH reply packet"));
+        if (s->hostkeydata) {
+            s->hkey = ssh->hostkey->newkey(ssh->hostkey,
+                                           s->hostkeydata, s->hostkeylen);
+        } else if (!ssh->null_hostkey_alg_ok) {
+            bombout(("unexpected null host key"));
             crStopV;
         }
+
         hash_string(ssh->kex->hash, ssh->exhash, s->hostkeydata, s->hostkeylen);
-        s->hkey = ssh->hostkey->newkey(ssh->hostkey,
-                                       s->hostkeydata, s->hostkeylen);
 
         {
             char *publicPoint;
@@ -7194,13 +7301,273 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
         }
 
         ssh_pkt_getstring(pktin, &s->sigdata, &s->siglen);
-        if (!s->sigdata) {
-            bombout(("unable to parse key exchange reply packet"));
+        if (!s->sigdata && !ssh->null_hostkey_alg_ok) {
+            bombout(("unexpected empty host key signature"));
             crStopV;
         }
 
         ssh_ecdhkex_freekey(s->eckey);
+#ifndef NO_GSSAPI
+    } else if (ssh->kex->main_type == KEXTYPE_GSS) {
+	int len;
+	char *data;
+
+        ssh->null_hostkey_alg_ok = 1;	/* OK from now onward */
+	ssh->pkt_kctx = SSH2_PKTCTX_GSSKEX;
+	s->init_token_sent = 0;
+	s->complete_rcvd = 0;
+        s->hostkeydata = NULL;
+        s->hostkeylen = 0;
+	s->hkey = NULL;
+	s->fingerprint = NULL;
+	s->keystr = NULL;
+
+        /*
+         * Work out the number of bits of key we will need from the
+         * key exchange. We start with the maximum key length of
+         * either cipher...
+         *
+         * This is rote from the KEXTYPE_DH section above.
+         */
+        {
+            int csbits, scbits;
+
+            csbits = s->cscipher_tobe->real_keybits;
+            scbits = s->sccipher_tobe->real_keybits;
+            s->nbits = (csbits > scbits ? csbits : scbits);
+        }
+        /* The keys only have hlen-bit entropy, since they're based on
+         * a hash. So cap the key size at hlen bits. */
+        if (s->nbits > ssh->kex->hash->hlen * 8)
+            s->nbits = ssh->kex->hash->hlen * 8;
+
+        if (dh_is_gex(ssh->kex)) {
+            /*
+             * Work out how big a DH group we will need to allow that
+             * much data.
+             */
+            s->pbits = 512 << ((s->nbits - 1) / 64);
+            logeventf(ssh, "Doing GSSAPI (with Kerberos V5) Diffie-Hellman "
+                      "group exchange, with minimum %d bits", s->pbits);
+            s->pktout = ssh2_pkt_init(SSH2_MSG_KEXGSS_GROUPREQ);
+            ssh2_pkt_adduint32(s->pktout, s->pbits); /* min */
+            ssh2_pkt_adduint32(s->pktout, s->pbits); /* preferred */
+            ssh2_pkt_adduint32(s->pktout, s->pbits * 2); /* max */
+            ssh2_pkt_send_noqueue(ssh, s->pktout);
+
+            crWaitUntilV(pktin);
+            if (pktin->type != SSH2_MSG_KEXGSS_GROUP) {
+                bombout(("expected key exchange group packet from server"));
+                crStopV;
+            }
+            s->p = ssh2_pkt_getmp(pktin);
+            s->g = ssh2_pkt_getmp(pktin);
+            if (!s->p || !s->g) {
+                bombout(("unable to read mp-ints from incoming group packet"));
+                crStopV;
+            }
+            ssh->kex_ctx = dh_setup_gex(s->p, s->g);
+        } else {
+            ssh->kex_ctx = dh_setup_group(ssh->kex);
+            logeventf(ssh, "Using GSSAPI (with Kerberos V5) Diffie-Hellman with standard group \"%s\"",
+                      ssh->kex->groupname);
+	}
+
+	logeventf(ssh, "Doing GSSAPI (with Kerberos V5) Diffie-Hellman key exchange with hash %s",
+                  ssh->kex->hash->text_name);
+        /* Now generate e for Diffie-Hellman. */
+        set_busy_status(ssh->frontend, BUSY_CPU); /* this can take a while */
+        s->e = dh_create_e(ssh->kex_ctx, s->nbits * 2);
+
+	if (ssh->gsslib->gsslogmsg)
+	    logevent(ssh->gsslib->gsslogmsg);
+
+	/* initial tokens are empty */
+	SSH_GSS_CLEAR_BUF(&s->gss_rcvtok);
+	SSH_GSS_CLEAR_BUF(&s->gss_sndtok);
+	SSH_GSS_CLEAR_BUF(&s->mic);
+	s->gss_stat = ssh->gsslib->acquire_cred(ssh->gsslib, &s->gss_ctx,
+						&s->gss_cred_expiry);
+	if (s->gss_stat != SSH_GSS_OK) {
+	    bombout(("GSSAPI key exchange failed to initialize"));
+	    crStopV;
+	}
+
+	/* now enter the loop */
+	assert(ssh->gss_srv_name);
+	do {
+	    /*
+	     * When acquire_cred yields no useful expiration, go with the
+	     * service ticket expiration.
+	     */
+	    s->gss_stat = ssh->gsslib->init_sec_context
+		(ssh->gsslib,
+		 &s->gss_ctx,
+		 ssh->gss_srv_name,
+		 s->gss_delegate,
+		 &s->gss_rcvtok,
+		 &s->gss_sndtok,
+		 s->gss_cred_expiry == 0 ? &s->gss_cred_expiry : NULL,
+		 NULL);
+	    SSH_GSS_CLEAR_BUF(&s->gss_rcvtok);
+
+	    if (s->gss_stat == SSH_GSS_S_COMPLETE && s->complete_rcvd)
+		break; /* MIC is verified after the loop */
+
+	    if (s->gss_stat != SSH_GSS_S_COMPLETE &&
+		s->gss_stat != SSH_GSS_S_CONTINUE_NEEDED) {
+		if (ssh->gsslib->display_status(ssh->gsslib, s->gss_ctx,
+					      &s->gss_buf) == SSH_GSS_OK) {
+		    bombout(("GSSAPI key exchange failed to initialize"
+			     " context: %s", (char *)s->gss_buf.value));
+		    sfree(s->gss_buf.value);
+		    crStopV;
+		} else {
+		    bombout(("GSSAPI key exchange failed to initialize"
+			     " context"));
+		    crStopV;
+		}
+	    }
+	    assert(s->gss_stat == SSH_GSS_S_COMPLETE ||
+		   s->gss_stat == SSH_GSS_S_CONTINUE_NEEDED);
+
+	    if (!s->init_token_sent) {
+		s->init_token_sent = 1;
+		s->pktout = ssh2_pkt_init(SSH2_MSG_KEXGSS_INIT);
+		if (s->gss_sndtok.length == 0) {
+		    bombout(("GSSAPI key exchange failed:"
+			     " no initial context token"));
+		    crStopV;
+		}
+		ssh_pkt_addstring_start(s->pktout);
+		ssh_pkt_addstring_data(s->pktout,
+				       s->gss_sndtok.value,
+				       s->gss_sndtok.length);
+		ssh2_pkt_addmp(s->pktout, s->e);
+		ssh2_pkt_send_noqueue(ssh, s->pktout);
+		ssh->gsslib->free_tok(ssh->gsslib, &s->gss_sndtok);
+		logevent("GSSAPI key exchange initialised");
+	    } else if (s->gss_sndtok.length != 0) {
+		s->pktout = ssh2_pkt_init(SSH2_MSG_KEXGSS_CONTINUE);
+		ssh_pkt_addstring_start(s->pktout);
+		ssh_pkt_addstring_data(s->pktout,
+				       s->gss_sndtok.value,
+				       s->gss_sndtok.length);
+		ssh2_pkt_send_noqueue(ssh, s->pktout);
+		ssh->gsslib->free_tok(ssh->gsslib, &s->gss_sndtok);
+	    }
+
+	    if (s->gss_stat == SSH_GSS_S_COMPLETE && s->complete_rcvd)
+		break;
+
+    wait_for_gss_token:
+	    crWaitUntilV(pktin);
+	    switch (pktin->type) {
+	    case SSH2_MSG_KEXGSS_CONTINUE:
+		ssh_pkt_getstring(pktin, &data, &len);
+		s->gss_rcvtok.value = data;
+		s->gss_rcvtok.length = len;
+		continue;
+	    case SSH2_MSG_KEXGSS_COMPLETE:
+		s->complete_rcvd = 1;
+		s->f = ssh2_pkt_getmp(pktin);
+		ssh_pkt_getstring(pktin, &data, &len);
+		s->mic.value = data;
+		s->mic.length = len;
+		/* Save expiration time of cred when delegating */
+		if (s->gss_delegate && s->gss_cred_expiry != 0)
+		    ssh->gss_cred_expiry = s->gss_cred_expiry;
+		/* If there's a final token we loop to consume it */
+		if (ssh2_pkt_getbool(pktin)) {
+		    ssh_pkt_getstring(pktin, &data, &len);
+		    s->gss_rcvtok.value = data;
+		    s->gss_rcvtok.length = len;
+		    continue;
+		}
+		break;
+	    case SSH2_MSG_KEXGSS_HOSTKEY:
+		ssh_pkt_getstring(pktin, &s->hostkeydata, &s->hostkeylen);
+		if (ssh->hostkey) {
+		    s->hkey = ssh->hostkey->newkey(ssh->hostkey,
+                                                   s->hostkeydata,
+						   s->hostkeylen);
+		    hash_string(ssh->kex->hash, ssh->exhash,
+				s->hostkeydata, s->hostkeylen);
+		}
+		logeventf(ssh, "Got a hostkey in GSS key exchange");
+		/*
+		 * Can't loop as we have no token to pass to
+		 * init_sec_context.
+		 */
+		goto wait_for_gss_token;
+	    case SSH2_MSG_KEXGSS_ERROR:
+		/*
+		 * We have no use for the server's major and minor
+		 * status.  The minor status is really only
+		 * meaningful to the server, and with luck the major
+		 * status means something to us (but not really all
+		 * that much).  The string is more meaningful, and
+		 * hopefully the server sends any error tokens, as
+		 * that will produce the most useful information for
+		 * us.
+		 */
+		ssh_pkt_getuint32(pktin); /* server's major status */
+		ssh_pkt_getuint32(pktin); /* server's minor status */
+		ssh_pkt_getstring(pktin, &data, &len);
+		logeventf(ssh, "GSSAPI key exchange failed; "
+			  "server's message: %.*s", len, data);
+		/* Language tag, but we have no use for it */
+		ssh_pkt_getstring(pktin, &data, &len);
+		/*
+		 * Wait for an error token, if there is one, or the
+		 * server's disconnect.  The error token, if there
+		 * is one, must follow the SSH2_MSG_KEXGSS_ERROR
+		 * message, per the RFC.
+		 */
+		goto wait_for_gss_token;
+	    default:
+		bombout(("unexpected message type during gss kex"));
+		crStopV;
+		break;
+	    }
+	} while (s->gss_rcvtok.length ||
+		 s->gss_stat == SSH_GSS_S_CONTINUE_NEEDED ||
+		 !s->complete_rcvd);
+
+	s->K = dh_find_K(ssh->kex_ctx, s->f);
+
+	/* We assume everything from now on will be quick, and it might
+	 * involve user interaction. */
+	set_busy_status(ssh->frontend, BUSY_NOT);
+
+	if (!s->hkey)
+	    hash_string(ssh->kex->hash, ssh->exhash, NULL, 0);
+	if (dh_is_gex(ssh->kex)) {
+	    /* min,  preferred, max */
+	    hash_uint32(ssh->kex->hash, ssh->exhash, s->pbits);
+	    hash_uint32(ssh->kex->hash, ssh->exhash, s->pbits);
+	    hash_uint32(ssh->kex->hash, ssh->exhash, s->pbits * 2);
+
+	    hash_mpint(ssh->kex->hash, ssh->exhash, s->p);
+	    hash_mpint(ssh->kex->hash, ssh->exhash, s->g);
+	}
+	hash_mpint(ssh->kex->hash, ssh->exhash, s->e);
+	hash_mpint(ssh->kex->hash, ssh->exhash, s->f);
+
+	/*
+	 * MIC verification is done below, after we compute the hash
+	 * used as the MIC input.
+	 */
+
+        dh_cleanup(ssh->kex_ctx);
+        freebn(s->f);
+        if (dh_is_gex(ssh->kex)) {
+            freebn(s->g);
+            freebn(s->p);
+        }
+#endif
     } else {
+	assert(ssh->kex->main_type == KEXTYPE_RSA);
 	logeventf(ssh, "Doing RSA key exchange with hash %s",
 		  ssh->kex->hash->text_name);
 	ssh->pkt_kctx = SSH2_PKTCTX_RSAKEX;
@@ -7319,6 +7686,48 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
     assert(ssh->kex->hash->hlen <= sizeof(s->exchange_hash));
     ssh->kex->hash->final(ssh->exhash, s->exchange_hash);
 
+#ifndef NO_GSSAPI
+    if (ssh->kex->main_type == KEXTYPE_GSS) {
+	Ssh_gss_buf gss_buf;
+	SSH_GSS_CLEAR_BUF(&s->gss_buf);
+
+	gss_buf.value = s->exchange_hash;
+	gss_buf.length = ssh->kex->hash->hlen;
+	s->gss_stat = ssh->gsslib->verify_mic(ssh->gsslib, s->gss_ctx, &gss_buf, &s->mic);
+	if (s->gss_stat != SSH_GSS_OK) {
+	    if (ssh->gsslib->display_status(ssh->gsslib, s->gss_ctx,
+                                            &s->gss_buf) == SSH_GSS_OK) {
+		bombout(("GSSAPI Key Exchange MIC was not valid: %s",
+			(char *)s->gss_buf.value));
+		sfree(s->gss_buf.value);
+	    } else {
+		bombout(("GSSAPI Key Exchange MIC was not valid"));
+	    }
+            crStopV;
+	}
+	/*-
+	 * If this the first KEX, save the GSS context for "gssapi-keyex"
+	 * authentication.
+	 *
+	 * http://tools.ietf.org/html/rfc4462#section-4
+	 *
+	 * This method may be used only if the initial key exchange was
+	 * performed using a GSS-API-based key exchange method defined in
+	 * accordance with Section 2.  The GSS-API context used with this
+	 * method is always that established during an initial GSS-API-based
+	 * key exchange.  Any context established during key exchange for the
+	 * purpose of rekeying MUST NOT be used with this method.
+	 */
+	if (!s->got_session_id) {
+	    ssh->gss_ctx = s->gss_ctx;
+            ssh->initial_used_gss = 1;
+        }
+	else
+            ssh->gsslib->release_cred(ssh->gsslib, &s->gss_ctx);
+        logeventf(ssh, "GSSAPI Key Exchange complete!");
+    }
+#endif
+
     ssh->kex_ctx = NULL;
 
 #if 0
@@ -7326,22 +7735,24 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
     dmemdump(s->exchange_hash, ssh->kex->hash->hlen);
 #endif
 
-    if (!s->hkey) {
-	bombout(("Server's host key is invalid"));
+    if (!s->hkey && !ssh->null_hostkey_alg_ok) {
+	bombout(("Server host key not provided"));
 	crStopV;
     }
 
-    if (!ssh->hostkey->verifysig(s->hkey, s->sigdata, s->siglen,
-				 (char *)s->exchange_hash,
-				 ssh->kex->hash->hlen)) {
+    /* In GSS keyex there's no hostkey signature to verify */
+    if (s->hkey && !ssh->hostkey->verifysig(s->hkey, s->sigdata, s->siglen,
+				            (char *)s->exchange_hash,
+                                            ssh->kex->hash->hlen)) {
 #ifndef FUZZING
 	bombout(("Server's host key did not match the signature supplied"));
 	crStopV;
 #endif
     }
 
-    s->keystr = ssh->hostkey->fmtkey(s->hkey);
-    if (!s->got_session_id) {
+    if (s->hkey && !s->got_session_id) {
+        int gss_authenticated = (ssh->kex->main_type == KEXTYPE_GSS);
+
 	/*
 	 * Make a note of any other host key formats that are available.
 	 */
@@ -7382,22 +7793,30 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * Authenticate remote host: verify host key. (We've already
          * checked the signature of the exchange hash.)
          */
+        s->keystr = ssh->hostkey->fmtkey(s->hkey);
         s->fingerprint = ssh2_fingerprint(ssh->hostkey, s->hkey);
         logevent("Host key fingerprint is:");
         logevent(s->fingerprint);
-        /* First check against manually configured host keys. */
-        s->dlgret = verify_ssh_manual_host_key(ssh, s->fingerprint,
-                                               ssh->hostkey, s->hkey);
+        /*
+	 * If not doing KEXGSS, first check against manually configured host
+	 * keys.  Since we don't auto-update the manual list, there's no point
+	 * in checking if we're ignoring the result (with KEXGSS).
+	 */
+	if (!gss_authenticated)
+	    s->dlgret = verify_ssh_manual_host_key(ssh, s->fingerprint,
+						   ssh->hostkey, s->hkey);
+	else
+	    s->dlgret = -1;
         if (s->dlgret == 0) {          /* did not match */
             bombout(("Host key did not appear in manually configured list"));
             crStopV;
         } else if (s->dlgret < 0) { /* none configured; use standard handling */
             ssh_set_frozen(ssh, 1);
-            s->dlgret = verify_ssh_host_key(ssh->frontend,
-                                            ssh->savedhost, ssh->savedport,
-                                            ssh->hostkey->keytype, s->keystr,
-                                            s->fingerprint,
-                                            ssh_dialog_callback, ssh);
+	    s->dlgret = verify_ssh_host_key(ssh->frontend,
+					    ssh->savedhost, ssh->savedport,
+					    ssh->hostkey->keytype, s->keystr,
+					    s->fingerprint, gss_authenticated,
+					    ssh_dialog_callback, ssh);
 #ifdef FUZZING
 	    s->dlgret = 1;
 #endif
@@ -7421,15 +7840,26 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
         }
         sfree(s->fingerprint);
         /*
+         * XXX: Lose this
          * Save this host key, to check against the one presented in
          * subsequent rekeys.
          */
         ssh->hostkey_str = s->keystr;
-    } else if (ssh->cross_certifying) {
+    } else if (ssh->cross_certifying && s->hkey) {
+        /*
+         * XXX: This is simply wrong.  Instead, implement the hostkeys-00
+         * and hostkeys-prove-00 protocols added to OpenSSH 6.8
+         *
+         * Note: those key rollover update messages are unrelated to transport,
+         * rather they are global-session requests.  These should instead be
+         * automatically used after each kex, without any action on the user's
+         * part.
+         */
         s->fingerprint = ssh2_fingerprint(ssh->hostkey, s->hkey);
         logevent("Storing additional host key for this host:");
         logevent(s->fingerprint);
         sfree(s->fingerprint);
+        s->keystr = ssh->hostkey->fmtkey(s->hkey);
         store_host_key(ssh->savedhost, ssh->savedport,
                        ssh->hostkey->keytype, s->keystr);
         ssh->cross_certifying = FALSE;
@@ -7437,23 +7867,32 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * Don't forget to store the new key as the one we'll be
          * re-checking in future normal rekeys.
          */
+        sfree(ssh->hostkey_str);
         ssh->hostkey_str = s->keystr;
-    } else {
+    } else if (s->hkey) {
         /*
          * In a rekey, we never present an interactive host key
          * verification request to the user. Instead, we simply
          * enforce that the key we're seeing this time is identical to
          * the one we saw before.
+         *
+         * We should not care if the server changes host keys, however, if the
+         * initial key was strongly authenticated (not known with GSSKEYEX),
+         * then we should store the new key.
          */
-        if (strcmp(ssh->hostkey_str, s->keystr)) {
+        s->keystr = ssh->hostkey->fmtkey(s->hkey);
+        if (strcmp(ssh->hostkey_str, s->keystr) && !ssh->initial_used_gss) {
 #ifndef FUZZING
-            bombout(("Host key was different in repeat key exchange"));
-            crStopV;
+            store_host_key(ssh->savedhost, ssh->savedport,
+                           ssh->hostkey->keytype, s->keystr);
 #endif
         }
         sfree(s->keystr);
     }
-    ssh->hostkey->freekey(s->hkey);
+    if (s->hkey) {
+        ssh->hostkey->freekey(s->hkey);
+        s->hkey = NULL;
+    }
 
     /*
      * The exchange hash from the very first key exchange is also
@@ -7646,9 +8085,7 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
      */
     ssh->kex_in_progress = FALSE;
     ssh->last_rekey = GETTICKCOUNT();
-    if (conf_get_int(ssh->conf, CONF_ssh_rekey_time) != 0)
-	ssh->next_rekey = schedule_timer(conf_get_int(ssh->conf, CONF_ssh_rekey_time)*60*TICKSPERSEC,
-					 ssh2_timer, ssh);
+    (void) ssh2_timer_update(ssh, 0);
 
     /*
      * Now we're encrypting. Begin returning 1 to the protocol main
@@ -7722,11 +8159,7 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
              * hit the event log _too_ often. */
             ssh->outgoing_data_size = 0;
             ssh->incoming_data_size = 0;
-            if (conf_get_int(ssh->conf, CONF_ssh_rekey_time) != 0) {
-                ssh->next_rekey =
-                    schedule_timer(conf_get_int(ssh->conf, CONF_ssh_rekey_time)*60*TICKSPERSEC,
-                                   ssh2_timer, ssh);
-            }
+	    (void) ssh2_timer_update(ssh, 0);
             goto wait_for_rekey;       /* this is still utterly horrid */
         } else {
             logeventf(ssh, "Initiating key re-exchange (%s)", (char *)in);
@@ -9243,7 +9676,10 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 	int tried_pubkey_config, done_agent;
 #ifndef NO_GSSAPI
 	int can_gssapi;
+	int can_gssapi_keyex;
 	int tried_gssapi;
+	int tried_gssapi_keyex; /* have tried userauth */
+	time_t gss_cred_expiry;
 #endif
 	int kbd_inter_refused;
 	int we_are_in, userauth_success;
@@ -9268,11 +9704,9 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 	struct Packet *pktout;
 	Filename *keyfile;
 #ifndef NO_GSSAPI
-	struct ssh_gss_library *gsslib;
 	Ssh_gss_ctx gss_ctx;
 	Ssh_gss_buf gss_buf;
 	Ssh_gss_buf gss_rcvtok, gss_sndtok;
-	Ssh_gss_name gss_srv_name;
 	Ssh_gss_stat gss_stat;
 #endif
     };
@@ -9307,6 +9741,7 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
     s->agent_response = NULL;
 #ifndef NO_GSSAPI
     s->tried_gssapi = FALSE;
+    s->tried_gssapi_keyex = FALSE;
 #endif
 
     if (!ssh->bare_connection) {
@@ -9741,20 +10176,15 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 		s->can_keyb_inter = conf_get_int(ssh->conf, CONF_try_ki_auth) &&
 		    in_commasep_string("keyboard-interactive", methods, methlen);
 #ifndef NO_GSSAPI
-                if (conf_get_int(ssh->conf, CONF_try_gssapi_auth) &&
-		    in_commasep_string("gssapi-with-mic", methods, methlen)) {
-                    /* Try loading the GSS libraries and see if we
-                     * have any. */
-                    if (!ssh->gsslibs)
-                        ssh->gsslibs = ssh_gss_setup(ssh->conf);
-                    s->can_gssapi = (ssh->gsslibs->nlibraries > 0);
-                } else {
-                    /* No point in even bothering to try to load the
-                     * GSS libraries, if the user configuration and
-                     * server aren't both prepared to attempt GSSAPI
-                     * auth in the first place. */
-                    s->can_gssapi = FALSE;
-                }
+		s->can_gssapi =
+		    conf_get_int(ssh->conf, CONF_try_gssapi_auth) &&
+		    in_commasep_string("gssapi-with-mic", methods, methlen) &&
+		    ssh->gsslibs->nlibraries > 0;
+		s->can_gssapi_keyex =
+		    conf_get_int(ssh->conf, CONF_try_gssapi_auth) &&
+		    in_commasep_string("gssapi-keyex", methods, methlen) &&
+		    ssh->gsslibs->nlibraries > 0 &&
+		    ssh->gss_ctx;
 #endif
 	    }
 
@@ -10091,60 +10521,53 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 		}
 
 #ifndef NO_GSSAPI
+	    } else if (s->can_gssapi_keyex && !s->tried_gssapi_keyex) {
+
+		/* gssapi-keyex authentication */
+
+		s->type = AUTH_TYPE_GSSAPI;
+		s->tried_gssapi_keyex = TRUE;
+		ssh->pkt_actx = SSH2_PKTCTX_GSSAPI;
+
+		if (ssh->gsslib->gsslogmsg)
+		    logevent(ssh->gsslib->gsslogmsg);
+
+                logeventf(ssh, "Trying gssapi-keyex...");
+		s->pktout =
+		    ssh2_gss_authpacket(ssh, ssh->gss_ctx, "gssapi-keyex");
+                ssh2_pkt_send(ssh, s->pktout);
+		ssh->gsslib->release_cred(ssh->gsslib, &ssh->gss_ctx);
+		ssh->gss_ctx = NULL;
+
+                continue;
 	    } else if (s->can_gssapi && !s->tried_gssapi) {
 
-		/* GSSAPI Authentication */
+		/* gssapi-with-mic authentication */
 
-		int micoffset, len;
+		int len;
 		char *data;
-		Ssh_gss_buf mic;
+
 		s->type = AUTH_TYPE_GSSAPI;
 		s->tried_gssapi = TRUE;
 		s->gotit = TRUE;
 		ssh->pkt_actx = SSH2_PKTCTX_GSSAPI;
 
-		/*
-		 * Pick the highest GSS library on the preference
-		 * list.
-		 */
-		{
-		    int i, j;
-		    s->gsslib = NULL;
-		    for (i = 0; i < ngsslibs; i++) {
-			int want_id = conf_get_int_int(ssh->conf,
-						       CONF_ssh_gsslist, i);
-			for (j = 0; j < ssh->gsslibs->nlibraries; j++)
-			    if (ssh->gsslibs->libraries[j].id == want_id) {
-				s->gsslib = &ssh->gsslibs->libraries[j];
-				goto got_gsslib;   /* double break */
-			    }
-		    }
-		    got_gsslib:
-		    /*
-		     * We always expect to have found something in
-		     * the above loop: we only came here if there
-		     * was at least one viable GSS library, and the
-		     * preference list should always mention
-		     * everything and only change the order.
-		     */
-		    assert(s->gsslib);
-		}
-
-		if (s->gsslib->gsslogmsg)
-		    logevent(s->gsslib->gsslogmsg);
+		if (ssh->gsslib->gsslogmsg)
+		    logevent(ssh->gsslib->gsslogmsg);
 
 		/* Sending USERAUTH_REQUEST with "gssapi-with-mic" method */
+                logeventf(ssh, "Trying gssapi-with-mic...");
 		s->pktout = ssh2_pkt_init(SSH2_MSG_USERAUTH_REQUEST);
 		ssh2_pkt_addstring(s->pktout, ssh->username);
 		ssh2_pkt_addstring(s->pktout, "ssh-connection");
 		ssh2_pkt_addstring(s->pktout, "gssapi-with-mic");
-                logevent("Attempting GSSAPI authentication");
+		logevent("Attempting GSSAPI authentication");
 
 		/* add mechanism info */
-		s->gsslib->indicate_mech(s->gsslib, &s->gss_buf);
+		ssh->gsslib->indicate_mech(ssh->gsslib, &s->gss_buf);
 
 		/* number of GSSAPI mechanisms */
-		ssh2_pkt_adduint32(s->pktout,1);
+		ssh2_pkt_adduint32(s->pktout, 1);
 
 		/* length of OID + 2 */
 		ssh2_pkt_adduint32(s->pktout, s->gss_buf.length + 2);
@@ -10163,7 +10586,6 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 		}
 
 		/* check returned packet ... */
-
 		ssh_pkt_getstring(pktin, &data, &len);
 		s->gss_rcvtok.value = data;
 		s->gss_rcvtok.length = len;
@@ -10176,24 +10598,26 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 		    continue;
 		}
 
-		/* now start running */
-		s->gss_stat = s->gsslib->import_name(s->gsslib,
-						     ssh->fullhostname,
-						     &s->gss_srv_name);
-		if (s->gss_stat != SSH_GSS_OK) {
-		    if (s->gss_stat == SSH_GSS_BAD_HOST_NAME)
-			logevent("GSSAPI import name failed - Bad service name");
-		    else
-			logevent("GSSAPI import name failed");
-		    continue;
+		/* Import server name if not cached from KEX */
+		if (ssh->gss_srv_name == GSS_C_NO_NAME) {
+		    s->gss_stat = ssh->gsslib->import_name(ssh->gsslib,
+							   ssh->fullhostname,
+							   &ssh->gss_srv_name);
+		    if (s->gss_stat != SSH_GSS_OK) {
+			if (s->gss_stat == SSH_GSS_BAD_HOST_NAME)
+			    logevent("GSSAPI import name failed -"
+				     " Bad service name");
+			else
+			    logevent("GSSAPI import name failed");
+			continue;
+		    }
 		}
 
-		/* fetch TGT into GSS engine */
-		s->gss_stat = s->gsslib->acquire_cred(s->gsslib, &s->gss_ctx);
-
+		/* Allocate our gss_ctx */
+		s->gss_stat = ssh->gsslib->acquire_cred(ssh->gsslib,
+							&s->gss_ctx, NULL);
 		if (s->gss_stat != SSH_GSS_OK) {
 		    logevent("GSSAPI authentication failed to get credentials");
-		    s->gsslib->release_name(s->gsslib, &s->gss_srv_name);
 		    continue;
 		}
 
@@ -10203,20 +10627,26 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 
 		/* now enter the loop */
 		do {
-		    s->gss_stat = s->gsslib->init_sec_context
-			(s->gsslib,
+		    /*
+		     * When acquire_cred yields no useful expiration, go with
+		     * the service ticket expiration.
+		     */
+		    s->gss_stat = ssh->gsslib->init_sec_context
+			(ssh->gsslib,
 			 &s->gss_ctx,
-			 s->gss_srv_name,
+			 ssh->gss_srv_name,
 			 conf_get_int(ssh->conf, CONF_gssapifwd),
 			 &s->gss_rcvtok,
-			 &s->gss_sndtok);
+			 &s->gss_sndtok,
+			 NULL,
+			 NULL);
 
-		    if (s->gss_stat!=SSH_GSS_S_COMPLETE &&
-			s->gss_stat!=SSH_GSS_S_CONTINUE_NEEDED) {
+		    if (s->gss_stat != SSH_GSS_S_COMPLETE &&
+			s->gss_stat != SSH_GSS_S_CONTINUE_NEEDED) {
 			logevent("GSSAPI authentication initialisation failed");
 
-			if (s->gsslib->display_status(s->gsslib, s->gss_ctx,
-						      &s->gss_buf) == SSH_GSS_OK) {
+			if (ssh->gsslib->display_status(ssh->gsslib,
+				s->gss_ctx, &s->gss_buf) == SSH_GSS_OK) {
 			    logevent(s->gss_buf.value);
 			    sfree(s->gss_buf.value);
 			}
@@ -10225,21 +10655,25 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 		    }
 		    logevent("GSSAPI authentication initialised");
 
-		    /* Client and server now exchange tokens until GSSAPI
-		     * no longer says CONTINUE_NEEDED */
-
+		    /*
+		     * Client and server now exchange tokens until GSSAPI
+		     * no longer says CONTINUE_NEEDED
+		     */
 		    if (s->gss_sndtok.length != 0) {
-			s->pktout = ssh2_pkt_init(SSH2_MSG_USERAUTH_GSSAPI_TOKEN);
+			s->pktout =
+			    ssh2_pkt_init(SSH2_MSG_USERAUTH_GSSAPI_TOKEN);
 			ssh_pkt_addstring_start(s->pktout);
-			ssh_pkt_addstring_data(s->pktout,s->gss_sndtok.value,s->gss_sndtok.length);
+			ssh_pkt_addstring_data(s->pktout, s->gss_sndtok.value,
+					       s->gss_sndtok.length);
 			ssh2_pkt_send(ssh, s->pktout);
-			s->gsslib->free_tok(s->gsslib, &s->gss_sndtok);
+			ssh->gsslib->free_tok(ssh->gsslib, &s->gss_sndtok);
 		    }
 
 		    if (s->gss_stat == SSH_GSS_S_CONTINUE_NEEDED) {
 			crWaitUntilV(pktin);
 			if (pktin->type != SSH2_MSG_USERAUTH_GSSAPI_TOKEN) {
-			    logevent("GSSAPI authentication - bad server response");
+			    logevent("GSSAPI authentication -"
+				     " bad server response");
 			    s->gss_stat = SSH_GSS_FAILURE;
 			    break;
 			}
@@ -10250,37 +10684,20 @@ static void do_ssh2_authconn(Ssh ssh, const unsigned char *in, int inlen,
 		} while (s-> gss_stat == SSH_GSS_S_CONTINUE_NEEDED);
 
 		if (s->gss_stat != SSH_GSS_OK) {
-		    s->gsslib->release_name(s->gsslib, &s->gss_srv_name);
-		    s->gsslib->release_cred(s->gsslib, &s->gss_ctx);
+		    ssh->gsslib->release_cred(ssh->gsslib, &s->gss_ctx);
 		    continue;
 		}
 		logevent("GSSAPI authentication loop finished OK");
 
 		/* Now send the MIC */
 
-		s->pktout = ssh2_pkt_init(0);
-		micoffset = s->pktout->length;
-		ssh_pkt_addstring_start(s->pktout);
-		ssh_pkt_addstring_data(s->pktout, (char *)ssh->v2_session_id, ssh->v2_session_id_len);
-		ssh_pkt_addbyte(s->pktout, SSH2_MSG_USERAUTH_REQUEST);
-		ssh_pkt_addstring(s->pktout, ssh->username);
-		ssh_pkt_addstring(s->pktout, "ssh-connection");
-		ssh_pkt_addstring(s->pktout, "gssapi-with-mic");
-
-		s->gss_buf.value = (char *)s->pktout->data + micoffset;
-		s->gss_buf.length = s->pktout->length - micoffset;
-
-		s->gsslib->get_mic(s->gsslib, s->gss_ctx, &s->gss_buf, &mic);
-		s->pktout = ssh2_pkt_init(SSH2_MSG_USERAUTH_GSSAPI_MIC);
-		ssh_pkt_addstring_start(s->pktout);
-		ssh_pkt_addstring_data(s->pktout, mic.value, mic.length);
+		s->pktout =
+		    ssh2_gss_authpacket(ssh, s->gss_ctx, "gssapi-with-mic");
 		ssh2_pkt_send(ssh, s->pktout);
-		s->gsslib->free_mic(s->gsslib, &mic);
 
 		s->gotit = FALSE;
 
-		s->gsslib->release_name(s->gsslib, &s->gss_srv_name);
-		s->gsslib->release_cred(s->gsslib, &s->gss_ctx);
+		ssh->gsslib->release_cred(ssh->gsslib, &s->gss_ctx);
 		continue;
 #endif
 	    } else if (s->can_keyb_inter && !s->kbd_inter_refused) {
@@ -11036,6 +11453,34 @@ static void ssh2_protocol_setup(Ssh ssh)
 {
     int i;
 
+#ifndef NO_GSSAPI
+    /* Load and pick the highest GSS library on the preference list. */
+    if (!ssh->gsslibs)
+        ssh->gsslibs = ssh_gss_setup(ssh->conf);
+    ssh->gsslib = NULL;
+    if (ssh->gsslibs->nlibraries > 0) {
+	int i, j;
+	for (i = 0; i < ngsslibs; i++) {
+	    int want_id = conf_get_int_int(ssh->conf,
+					   CONF_ssh_gsslist, i);
+	    for (j = 0; j < ssh->gsslibs->nlibraries; j++)
+		if (ssh->gsslibs->libraries[j].id == want_id) {
+		    ssh->gsslib = &ssh->gsslibs->libraries[j];
+		    goto got_gsslib;   /* double break */
+		}
+	}
+	got_gsslib:
+	/*
+	 * We always expect to have found something in
+	 * the above loop: we only came here if there
+	 * was at least one viable GSS library, and the
+	 * preference list should always mention
+	 * everything and only change the order.
+	 */
+	assert(ssh->gsslib);
+    }
+#endif
+
     /*
      * Most messages cause SSH2_MSG_UNIMPLEMENTED.
      */
@@ -11059,6 +11504,7 @@ static void ssh2_protocol_setup(Ssh ssh)
     /* ssh->packet_dispatch[SSH2_MSG_KEX_DH_GEX_GROUP] = ssh2_msg_transport; duplicate case value */
     ssh->packet_dispatch[SSH2_MSG_KEX_DH_GEX_INIT] = ssh2_msg_transport;
     ssh->packet_dispatch[SSH2_MSG_KEX_DH_GEX_REPLY] = ssh2_msg_transport;
+    ssh->packet_dispatch[SSH2_MSG_KEXGSS_GROUP] = ssh2_msg_transport;
     ssh->packet_dispatch[SSH2_MSG_USERAUTH_REQUEST] = ssh2_msg_unexpected;
     ssh->packet_dispatch[SSH2_MSG_USERAUTH_FAILURE] = ssh2_msg_unexpected;
     ssh->packet_dispatch[SSH2_MSG_USERAUTH_SUCCESS] = ssh2_msg_unexpected;
@@ -11132,18 +11578,262 @@ static void ssh2_bare_connection_protocol_setup(Ssh ssh)
     ssh->packet_dispatch[SSH2_MSG_DEBUG] = ssh2_msg_debug;
 }
 
+#ifndef NO_GSSAPI
+static struct Packet *ssh2_gss_authpacket(Ssh ssh, Ssh_gss_ctx gss_ctx,
+					  const char *authtype)
+{
+    struct Packet *p = ssh2_pkt_init(0);
+    int micoffset = p->length;
+    Ssh_gss_buf buf;
+    Ssh_gss_buf mic;
+
+    /*
+     * The mic is computed over the session id + intended packet, so we
+     * build an artificial packet with a prepended session id.
+     */
+    ssh_pkt_addstring_start(p);
+    ssh_pkt_addstring_data(p, (char *)ssh->v2_session_id,
+			   ssh->v2_session_id_len);
+    ssh_pkt_addbyte(p, SSH2_MSG_USERAUTH_REQUEST);
+    ssh_pkt_addstring(p, ssh->username);
+    ssh_pkt_addstring(p, "ssh-connection");
+    ssh_pkt_addstring(p, authtype);
+
+    /* Compute the mic */
+    buf.value = (char *)p->data + micoffset;
+    buf.length = p->length - micoffset;
+    ssh->gsslib->get_mic(ssh->gsslib, gss_ctx, &buf, &mic);
+    ssh_free_packet(p);
+
+    /* Now we can build the real packet */
+    if (strcmp(authtype, "gssapi-with-mic") == 0) {
+        p = ssh2_pkt_init(SSH2_MSG_USERAUTH_GSSAPI_MIC);
+    } else {
+        p = ssh2_pkt_init(SSH2_MSG_USERAUTH_REQUEST);
+        ssh2_pkt_addstring(p, ssh->username);
+        ssh2_pkt_addstring(p, "ssh-connection");
+        ssh2_pkt_addstring(p, authtype);
+    }
+    ssh_pkt_addstring_start(p);
+    ssh_pkt_addstring_data(p, (char *)mic.value, mic.length);
+
+    return p;
+}
+
+/*
+ * This is called at the beginning of each SSH rekey to determine whether we are
+ * GSS capable, and if we did GSS key exchange, and are delegating credentials,
+ * it is also called periodically to determine whether we should rekey in order
+ * to delegate (more) fresh credentials.  This is called "credential cascading".
+ *
+ * On Windows, with SSPI, we may not get the credential expiration, as Windows
+ * automatically renews from cached passwords, so the credential effectively
+ * never expires.  Since we still want to cascade when the local TGT is updated,
+ * we use the expiration of a newly obtained context as a proxy for the
+ * expiration of the TGT.
+ */
+static void ssh2_gss_update(Ssh ssh)
+{
+    int i;
+    int gss_stat;
+    time_t gss_cred_expiry;
+    unsigned long mins;
+    Ssh_gss_buf gss_sndtok;
+    Ssh_gss_buf gss_rcvtok;
+    Ssh_gss_ctx gss_ctx;
+
+    ssh->gss_status = 0;
+
+    /*
+     * Nothing to do if no GSSAPI libraries are configured or GSSAPI auth is not
+     * enabled.
+     */
+    if (ssh->gsslibs->nlibraries == 0)
+	return;
+    if (!conf_get_int(ssh->conf, CONF_try_gssapi_auth))
+        return;
+
+    /* Import server name and cache it */
+    if (ssh->gss_srv_name == GSS_C_NO_NAME) {
+	gss_stat = ssh->gsslib->import_name(ssh->gsslib,
+					    ssh->fullhostname,
+					    &ssh->gss_srv_name);
+	if (gss_stat != SSH_GSS_OK) {
+	    if (gss_stat == SSH_GSS_BAD_HOST_NAME)
+		logevent("GSSAPI import name failed -"
+			 " Bad service name; won't use GSS key exchange");
+	    else
+		logevent("GSSAPI import name failed;"
+			 " won't use GSS key exchange");
+	    return;
+	}
+    }
+
+    /*
+     * Do we (still) have credentials?  Capture the credential expiration when
+     * available
+     */
+    gss_stat = ssh->gsslib->acquire_cred(ssh->gsslib,
+					 &gss_ctx,
+					 &gss_cred_expiry);
+    if (gss_stat != SSH_GSS_OK)
+	return;
+
+    SSH_GSS_CLEAR_BUF(&gss_sndtok);
+    SSH_GSS_CLEAR_BUF(&gss_rcvtok);
+
+#define DONT_DELEGATE 0
+    /*
+     * When acquire_cred yields no useful expiration, get a proxy for the cred
+     * expiration from the context expiration.
+     */
+    gss_stat = ssh->gsslib->init_sec_context(ssh->gsslib,
+	&gss_ctx, ssh->gss_srv_name, DONT_DELEGATE,
+	&gss_rcvtok, &gss_sndtok, gss_cred_expiry == 0 ? &gss_cred_expiry : NULL,
+	&ssh->gss_ctxt_lifetime);
+
+    /* This context was for testing only. */
+    if (gss_ctx)
+	ssh->gsslib->release_cred(ssh->gsslib, &gss_ctx);
+
+    if (gss_stat != SSH_GSS_OK &&
+	gss_stat != SSH_GSS_S_CONTINUE_NEEDED) {
+	logeventf(ssh, "GSSAPI init sec context failed;"
+		  " won't use GSS key exchange");
+	return;
+    }
+
+    if (gss_sndtok.length)
+	ssh->gsslib->free_tok(ssh->gsslib, &gss_sndtok);
+
+    ssh->gss_status |= GSS_KEX_CAPABLE;
+
+    /*
+     * When rekeying to cascade, avoding doing this too close to the context
+     * expiration time, since the key exchange might fail.
+     */
+    if (ssh->gss_ctxt_lifetime < MIN_CTXT_LIFETIME)
+	ssh->gss_status |= GSS_CTXT_MAYFAIL;
+
+    /*
+     * If we're not delegating credentials, rekeying is not used to refresh
+     * them.  We must avoid setting GSS_CRED_UPDATED or GSS_CTXT_EXPIRES when
+     * credential delegation is disabled.
+     */
+    if (conf_get_int(ssh->conf, CONF_gssapifwd) == 0)
+	return;
+
+    if (ssh->gss_cred_expiry != 0 && gss_cred_expiry > ssh->gss_cred_expiry)
+	ssh->gss_status |= GSS_CRED_UPDATED;
+
+    mins = conf_get_int(ssh->conf, CONF_gssapirekey);
+    mins = rekey_mins(mins, GSS_DEF_REKEY_MINS);
+    if (mins > 0 && ssh->gss_ctxt_lifetime <= mins * 60)
+	ssh->gss_status |= GSS_CTXT_EXPIRES;
+}
+#endif
+
+/*
+ * The rekey_time is zero except when re-configuring.
+ *
+ * We either schedule the next timer and return 0, or return 1 to run the
+ * callback now, which will call us again to re-schedule on completion.
+ */
+static int ssh2_timer_update(Ssh ssh, unsigned long rekey_time)
+{
+    unsigned long mins;
+    unsigned long ticks;
+
+    mins = conf_get_int(ssh->conf, CONF_ssh_rekey_time);
+    mins = rekey_mins(mins, 60);
+    ticks = mins * 60 * TICKSPERSEC;
+
+    /* Handle change from previous setting */
+    if (rekey_time != 0 && rekey_time != mins) {
+	unsigned long next;
+	unsigned long now = GETTICKCOUNT();
+
+	mins = rekey_time;
+	ticks = mins * 60 * TICKSPERSEC;
+	next = ssh->last_rekey + ticks;
+
+	/* If overdue, caller will rekey synchronously now */
+	if (now - ssh->last_rekey > ticks)
+	    return 1;
+	ticks = next - now;
+    }
+
+#ifndef NO_GSSAPI
+    {
+	unsigned long gssmins;
+
+        /* Check cascade conditions more frequently if configured */
+	gssmins = conf_get_int(ssh->conf, CONF_gssapirekey);
+	gssmins = rekey_mins(gssmins, GSS_DEF_REKEY_MINS);
+	if (gssmins > 0) {
+	    if (gssmins < mins)
+		ticks = (mins = gssmins) * 60 * TICKSPERSEC;
+
+	    if ((ssh->gss_status & GSS_KEX_CAPABLE) != 0) {
+		/*
+                 * Run next timer even sooner if it would otherwise be too close
+                 * to the context expiration time
+		 */
+		if ((ssh->gss_status & GSS_CTXT_EXPIRES) == 0 &&
+		    ssh->gss_ctxt_lifetime - mins * 60 < 2 * MIN_CTXT_LIFETIME)
+		    ticks -= 2 * MIN_CTXT_LIFETIME * TICKSPERSEC;
+	    }
+	}
+    }
+#endif
+
+    /* Schedule the next timer */
+    ssh->next_rekey = schedule_timer(ticks, ssh2_timer, ssh);
+    return 0;
+}
+
 static void ssh2_timer(void *ctx, unsigned long now)
 {
     Ssh ssh = (Ssh)ctx;
+    unsigned long mins;
+    unsigned long ticks;
 
-    if (ssh->state == SSH_STATE_CLOSED)
+    if (ssh->state == SSH_STATE_CLOSED ||
+	ssh->kex_in_progress ||
+	ssh->bare_connection ||
+	now != ssh->next_rekey)
 	return;
 
-    if (!ssh->kex_in_progress && !ssh->bare_connection &&
-        conf_get_int(ssh->conf, CONF_ssh_rekey_time) != 0 &&
-	now == ssh->next_rekey) {
+    mins = conf_get_int(ssh->conf, CONF_ssh_rekey_time);
+    mins = rekey_mins(mins, 60);
+    if (mins == 0)
+	return;
+
+    /* Rekey if enough time has elapsed */
+    ticks = mins * 60 * TICKSPERSEC;
+    if (now - ssh->last_rekey > ticks - 30*TICKSPERSEC) {
 	do_ssh2_transport(ssh, "timeout", -1, NULL);
+	return;
     }
+
+#ifndef NO_GSSAPI
+    /*
+     * Rekey now if we have a new cred or context expires this cycle, but not if
+     * this is unsafe.
+     */
+    if (conf_get_int(ssh->conf, CONF_gssapirekey)) {
+	ssh2_gss_update(ssh);
+	if ((ssh->gss_status & GSS_KEX_CAPABLE) != 0 &&
+	    (ssh->gss_status & GSS_CTXT_MAYFAIL) == 0 &&
+	    (ssh->gss_status & (GSS_CRED_UPDATED|GSS_CTXT_EXPIRES)) != 0) {
+	    do_ssh2_transport(ssh, "gssupdate", -1, NULL);
+	    return;
+	}
+    }
+#endif
+
+    /* Try again later. */
+    (void) ssh2_timer_update(ssh, 0);
 }
 
 static void ssh2_protocol(Ssh ssh, const void *vin, int inlen,
@@ -11223,7 +11913,6 @@ static const char *ssh_init(void *frontend_handle, void **backend_handle,
     ssh->kex = NULL;
     ssh->kex_ctx = NULL;
     ssh->hostkey = NULL;
-    ssh->hostkey_str = NULL;
     ssh->exitcode = -1;
     ssh->close_expected = FALSE;
     ssh->clean_exit = FALSE;
@@ -11276,6 +11965,14 @@ static const char *ssh_init(void *frontend_handle, void **backend_handle,
     ssh->specials = NULL;
     ssh->n_uncert_hostkeys = 0;
     ssh->cross_certifying = FALSE;
+    ssh->null_hostkey_alg_ok = 0;
+
+#ifndef NO_GSSAPI
+    ssh->gss_cred_expiry = 0;
+    ssh->gss_srv_name = GSS_C_NO_NAME;
+    ssh->gss_ctx = NULL;
+    ssh->initial_used_gss = 0;
+#endif
 
     *backend_handle = ssh;
 
@@ -11421,7 +12118,6 @@ static void ssh_free(void *handle)
     sfree(ssh->v_c);
     sfree(ssh->v_s);
     sfree(ssh->fullhostname);
-    sfree(ssh->hostkey_str);
     sfree(ssh->specials);
     if (ssh->crcda_ctx) {
 	crcda_free_context(ssh->crcda_ctx);
@@ -11440,6 +12136,10 @@ static void ssh_free(void *handle)
         agent_cancel_query(ssh->auth_agent_query);
 
 #ifndef NO_GSSAPI
+    if (ssh->gss_srv_name)
+	ssh->gsslib->release_name(ssh->gsslib, &ssh->gss_srv_name);
+    if (ssh->gss_ctx != NULL)
+	ssh->gsslib->release_cred(ssh->gsslib, &ssh->gss_ctx);
     if (ssh->gsslibs)
 	ssh_gss_cleanup(ssh->gsslibs);
 #endif
@@ -11466,17 +12166,8 @@ static void ssh_reconfig(void *handle, Conf *conf)
 	ssh_setup_portfwd(ssh, conf);
 
     rekey_time = conf_get_int(conf, CONF_ssh_rekey_time);
-    if (conf_get_int(ssh->conf, CONF_ssh_rekey_time) != rekey_time &&
-	rekey_time != 0) {
-	unsigned long new_next = ssh->last_rekey + rekey_time*60*TICKSPERSEC;
-	unsigned long now = GETTICKCOUNT();
-
-	if (now - ssh->last_rekey > rekey_time*60*TICKSPERSEC) {
-	    rekeying = "timeout shortened";
-	} else {
-	    ssh->next_rekey = schedule_timer(new_next - now, ssh2_timer, ssh);
-	}
-    }
+    if (ssh2_timer_update(ssh, rekey_mins(rekey_time, 60)))
+	rekeying = "timeout shortened";
 
     old_max_data_size = ssh->max_data_size;
     ssh->max_data_size = parse_blocksize(conf_get_str(ssh->conf,

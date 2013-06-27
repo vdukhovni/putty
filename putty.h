@@ -28,6 +28,13 @@ typedef struct terminal_tag Terminal;
 #include "misc.h"
 
 /*
+ * We express various time intervals in unsigned long minutes, but may need to
+ * clip some values so that the resulting number of ticks does not overflow an
+ * integer value.
+ */
+#define MAX_TICK_MINS	(INT_MAX / (60 * TICKSPERSEC))
+
+/*
  * Fingerprints of the PGP master keys that can be used to establish a trust
  * path between an executable and other files.
  */
@@ -264,6 +271,9 @@ enum {
     KEX_DHGEX,
     KEX_RSA,
     KEX_ECDH,
+    KEX_MAX_CONF = KEX_ECDH,
+    /* Kexes from here to KEX_MAX are not explicitly configurable */
+    KEX_GSS_SHA1_K5,
     KEX_MAX
 };
 
@@ -789,6 +799,7 @@ void cleanup_exit(int);
     X(INT, NONE, try_ki_auth) \
     X(INT, NONE, try_gssapi_auth) /* attempt gssapi auth */ \
     X(INT, NONE, gssapifwd) /* forward tgt via gss */ \
+    X(INT, NONE, gssapirekey) /* KEXGSS refresh interval (mins) */ \
     X(INT, INT, ssh_gsslist) /* preference order for local GSS libs */ \
     X(FILENAME, NONE, ssh_gss_custom) \
     X(INT, NONE, ssh_subsys) /* run a subsystem rather than a command */ \
@@ -1322,6 +1333,7 @@ void pgp_fingerprints(void);
  */
 int verify_ssh_host_key(void *frontend, char *host, int port,
                         const char *keytype, char *keystr, char *fingerprint,
+                        int gss_authenticated,
                         void (*callback)(void *ctx, int result), void *ctx);
 /*
  * have_ssh_host_key() just returns true if a key of that type is
