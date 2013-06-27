@@ -142,16 +142,11 @@ fi
 
 AC_SEARCH_LIBS([socket], [xnet])
 
-AS_IF([test "x$with_gssapi" != xno],
-  [AC_SEARCH_LIBS(
-    [dlopen],[dl],
-    [],
-    [AC_DEFINE([NO_LIBDL], [1], [Define if we could not find libdl.])
-     AC_CHECK_HEADERS([gssapi/gssapi.h])
-     AC_SEARCH_LIBS(
-       [gss_init_sec_context],[gssapi gssapi_krb5 gss],
-       [],
-       [AC_DEFINE([NO_GSSAPI_LIB], [1], [Define if we could not find a gssapi library])])])])
+AC_SEARCH_LIBS([dlopen],[dl])
+AC_CHECK_HEADERS([gssapi/gssapi.h])
+AC_SEARCH_LIBS([gss_init_sec_context],[gssapi gssapi_krb5 gss],
+               [],
+               [AC_DEFINE([NO_GSSAPI_LIB], [1], [Define if we could not find a gssapi library])])
 
 AC_CHECK_LIB(X11, XOpenDisplay,
              [GTK_LIBS="-lX11 $GTK_LIBS"
