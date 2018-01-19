@@ -790,6 +790,7 @@ void showabout(HWND hwnd)
 
 int verify_ssh_host_key(void *frontend, char *host, int port,
                         const char *keytype, char *keystr, char *fingerprint,
+                        int gss_authenticated,
                         void (*callback)(void *ctx, int result), void *ctx)
 {
     int ret;
@@ -829,6 +830,12 @@ int verify_ssh_host_key(void *frontend, char *host, int port,
     /*
      * Verify the key against the registry.
      */
+    if (gss_authenticated) {
+        ret = verify_host_key(host, port, keytype, keystr);
+        if (ret > 0)
+	    store_host_key(host, port, keytype, keystr);
+        return 1;
+    }
     ret = verify_host_key(host, port, keytype, keystr);
 
     if (ret == 0)		       /* success - key matched OK */
