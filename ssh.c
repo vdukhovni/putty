@@ -791,6 +791,7 @@ struct ssh_tag {
     const struct ssh_kex *kex;
     const struct ssh_signkey *hostkey;
     char *hostkey_str; /* string representation, for easy checking in rekeys */
+    int warned; /* Did initial handshake use warned algorithms */
     unsigned char v2_session_id[SSH2_KEX_MAX_HASH_LEN];
     int v2_session_id_len;
     void *kex_ctx;
@@ -6538,62 +6539,54 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 		alg->u.kex.warn = warn;
 	    }
 	}
-	/* List server host key algorithms. */
-        if (!s->got_session_id) {
-            /*
-             * In the first key exchange, we list all the algorithms
-             * we're prepared to cope with, but prefer those algorithms
-	     * for which we have a host key for this host.
-             *
-             * If the host key algorithm is below the warning
-             * threshold, we warn even if we did already have a key
-             * for it, on the basis that if the user has just
-             * reconfigured that host key type to be warned about,
-             * they surely _do_ want to be alerted that a server
-             * they're actually connecting to is using it.
-             */
-            warn = FALSE;
-            for (i = 0; i < s->n_preferred_hk; i++) {
-                if (s->preferred_hk[i] == HK_WARN)
-                    warn = TRUE;
-                for (j = 0; j < lenof(hostkey_algs); j++) {
-                    if (hostkey_algs[j].id != s->preferred_hk[i])
-                        continue;
-                    if (have_ssh_host_key(ssh->savedhost, ssh->savedport,
-                                          hostkey_algs[j].alg->keytype)) {
-                        alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
-                                                  hostkey_algs[j].alg->name);
-                        alg->u.hk.hostkey = hostkey_algs[j].alg;
-                        alg->u.hk.warn = warn;
-                    }
-                }
-	    }
-            warn = FALSE;
-            for (i = 0; i < s->n_preferred_hk; i++) {
-                if (s->preferred_hk[i] == HK_WARN)
-                    warn = TRUE;
-                for (j = 0; j < lenof(hostkey_algs); j++) {
-                    if (hostkey_algs[j].id != s->preferred_hk[i])
-                        continue;
+	/*
+         * List server host key algorithms.
+         *
+         * On initial key exchange we prefer those algorithms for which we have
+         * a host key for this host.  On rekeys we allow host key upgrades
+         * without prompting since the host is already authenticated.  This
+         * makes it possible to smoothly transition to stronger host keys.
+         *
+         * Note: On initial kex if warned, don't later silently store new host
+         * keys.
+         *
+         * If the host key algorithm is below the warning threshold, we warn
+         * even if we did already have a key for it, on the basis that if the
+         * user has just reconfigured that host key type to be warned about,
+         * they surely _do_ want to be alerted that a server they're actually
+         * connecting to is using it.
+         *
+         * Note: there's no need to warn about hostkey algorithms when
+         * rekeying, the initial host authentication is sufficient.
+         */
+        warn = FALSE;
+        for (i = 0; i < s->n_preferred_hk && !s->got_session_id; i++) {
+            if (s->preferred_hk[i] == HK_WARN)
+                warn = TRUE;
+            for (j = 0; j < lenof(hostkey_algs); j++) {
+                if (hostkey_algs[j].id != s->preferred_hk[i])
+                    continue;
+                if (have_ssh_host_key(ssh->savedhost, ssh->savedport,
+                                      hostkey_algs[j].alg->keytype)) {
                     alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
                                               hostkey_algs[j].alg->name);
                     alg->u.hk.hostkey = hostkey_algs[j].alg;
                     alg->u.hk.warn = warn;
                 }
             }
-        } else {
-            /*
-             * In subsequent key exchanges, we list only the kex
-             * algorithm that was selected in the first key exchange,
-             * so that we keep getting the same host key and hence
-             * don't have to interrupt the user's session to ask for
-             * reverification.
-             */
-            assert(ssh->kex);
-	    alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
-				      ssh->hostkey->name);
-	    alg->u.hk.hostkey = ssh->hostkey;
-            alg->u.hk.warn = FALSE;
+        }
+        warn = FALSE;
+        for (i = 0; i < s->n_preferred_hk; i++) {
+            if (s->preferred_hk[i] == HK_WARN && !s->got_session_id)
+                warn = TRUE;
+            for (j = 0; j < lenof(hostkey_algs); j++) {
+                if (hostkey_algs[j].id != s->preferred_hk[i])
+                    continue;
+                alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
+                                          hostkey_algs[j].alg->name);
+                alg->u.hk.hostkey = hostkey_algs[j].alg;
+                alg->u.hk.warn = warn;
+            }
         }
 	/* List encryption algorithms (client->server then server->client). */
 	for (k = KEXLIST_CSCIPHER; k <= KEXLIST_SCCIPHER; k++) {
@@ -6726,6 +6719,8 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 		bombout(("KEXINIT packet was incomplete"));
 		crStopV;
 	    }
+            logeventf(ssh, "Server offered these %s algorithms: %.*s",
+                      kexlist_descr[i], len, str);
 
             /* If we've already selected a cipher which requires a
              * particular MAC, then just select that, and don't even
@@ -7425,7 +7420,18 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * subsequent rekeys.
          */
         ssh->hostkey_str = s->keystr;
+        ssh->warned =
+            s->warn_kex | s->warn_hk | s->warn_cscipher | s->warn_sccipher;
     } else if (ssh->cross_certifying) {
+        /*
+         * XXX: This is simply wrong.  Instead, implement the hostkeys-00
+         * and hostkeys-prove-00 protocols added to OpenSSH 6.8
+         *
+         * Note: those key rollover update messages are unrelated to transport,
+         * rather they are global-session requests.  These should instead be
+         * automatically used after each kex, without any action on the user's
+         * part.
+         */
         s->fingerprint = ssh2_fingerprint(ssh->hostkey, s->hkey);
         logevent("Storing additional host key for this host:");
         logevent(s->fingerprint);
@@ -7437,21 +7443,26 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * Don't forget to store the new key as the one we'll be
          * re-checking in future normal rekeys.
          */
+        sfree(ssh->hostkey_str);
         ssh->hostkey_str = s->keystr;
     } else {
         /*
-         * In a rekey, we never present an interactive host key
-         * verification request to the user. Instead, we simply
-         * enforce that the key we're seeing this time is identical to
-         * the one we saw before.
+         * We do not care if the server changes host keys, however, if the
+         * initial key was strongly authenticated with non-warning algorithms
+         * (not definitively knowable with GSSKEYEX), then we should store the
+         * new key.
          */
-        if (strcmp(ssh->hostkey_str, s->keystr)) {
+        s->keystr = ssh->hostkey->fmtkey(s->hkey);
+        if (!ssh->warned && strcmp(ssh->hostkey_str, s->keystr)) {
 #ifndef FUZZING
-            bombout(("Host key was different in repeat key exchange"));
-            crStopV;
+            store_host_key(ssh->savedhost, ssh->savedport,
+                           ssh->hostkey->keytype, s->keystr);
+            sfree(ssh->hostkey_str);
+            ssh->hostkey_str = s->keystr;
 #endif
+        } else {
+            sfree(s->keystr);
         }
-        sfree(s->keystr);
     }
     ssh->hostkey->freekey(s->hkey);
 
@@ -11224,6 +11235,7 @@ static const char *ssh_init(void *frontend_handle, void **backend_handle,
     ssh->kex_ctx = NULL;
     ssh->hostkey = NULL;
     ssh->hostkey_str = NULL;
+    ssh->warned = 0;
     ssh->exitcode = -1;
     ssh->close_expected = FALSE;
     ssh->clean_exit = FALSE;
