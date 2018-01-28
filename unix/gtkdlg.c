@@ -3871,15 +3871,16 @@ static void eventlog_list_handler(union control *ctrl, void *dlg,
             }
         }
         for (i = 0; i < es->ncircular; i++) {
-            if (dlg_listbox_issel(ctrl, dlg, ninitial + i)) {
-                int extralen = strlen(es->events_circular[(es->circular_first + i) % LOGEVENT_CIRCULAR_MAX]);
+            if (dlg_listbox_issel(ctrl, dlg, es->ninitial + i)) {
+                int j = (es->circular_first + i) % LOGEVENT_CIRCULAR_MAX;
+                int extralen = strlen(es->events_circular[j]);
 
                 if (es->sellen + extralen + 2 > selsize) {
                     selsize = es->sellen + extralen + 512;
                     es->seldata = sresize(es->seldata, selsize, char);
                 }
 
-                strcpy(es->seldata + es->sellen, es->events_circular[i]);
+                strcpy(es->seldata + es->sellen, es->events_circular[j]);
                 es->sellen += extralen;
                 es->seldata[es->sellen++] = '\n';
             }
