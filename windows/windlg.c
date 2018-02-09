@@ -761,15 +761,11 @@ int do_reconfig(HWND hwnd, int protcfginfo)
     return ret;
 }
 
-#define MAXLOGMSGLEN 1000
-
 void logevent(void *frontend, const char *string)
 {
     char timebuf[40];
     char **location;
     struct tm tm;
-    size_t slen = strlen(string);
-    size_t len = (slen > MAXLOGMSGLEN) ? MAXLOGMSGLEN : slen;
 
     log_eventlog(logctx, string);
 
@@ -783,9 +779,7 @@ void logevent(void *frontend, const char *string)
 
     if (*location)
         sfree(*location);
-    *location = snewn(strlen(timebuf) + len + 1, char);
-    strcpy(*location, timebuf);
-    strncat(*location, string, len);
+    *location = dupcat(timebuf, string, NULL);
     if (logbox) {
 	int count;
 	SendDlgItemMessage(logbox, IDN_LIST, LB_ADDSTRING,
@@ -800,8 +794,7 @@ void logevent(void *frontend, const char *string)
     } else if (ncircular == LOGEVENT_CIRCULAR_MAX) {
         circular_first = (circular_first + 1) % LOGEVENT_CIRCULAR_MAX;
         sfree(events_circular[circular_first]);
-        events_circular[circular_first] = snewn(sizeof(".."), char);
-        strcpy(events_circular[circular_first], "..");
+        events_circular[circular_first] = dupstr("..");
     }
 }
 

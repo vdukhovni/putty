@@ -4026,8 +4026,6 @@ void *eventlogstuff_new(void)
     return es;
 }
 
-#define MAXLOGMSGLEN 1000
-
 void logevent_dlg(void *estuff, const char *string)
 {
     struct eventlog_stuff *es = (struct eventlog_stuff *)estuff;
@@ -4035,8 +4033,6 @@ void logevent_dlg(void *estuff, const char *string)
     struct tm tm;
     char **location;
     size_t i;
-    size_t slen = strlen(string);
-    size_t len = (slen > MAXLOGMSGLEN) ? MAXLOGMSGLEN : slen;
 
     if (es->ninitial == 0) {
         es->events_initial = sresize(es->events_initial, LOGEVENT_INITIAL_MAX, char *);
@@ -4056,9 +4052,7 @@ void logevent_dlg(void *estuff, const char *string)
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S\t", &tm);
 
     sfree(*location);
-    *location = snewn(strlen(timebuf) + len + 1, char);
-    strcpy(*location, timebuf);
-    strncat(*location, string, len);
+    *location = dupcat(timebuf, string, NULL);
     if (es->window) {
 	dlg_listbox_add(es->listctrl, &es->dp, *location);
     }
@@ -4069,9 +4063,7 @@ void logevent_dlg(void *estuff, const char *string)
     } else if (es->ncircular == LOGEVENT_CIRCULAR_MAX) {
         es->circular_first = (es->circular_first + 1) % LOGEVENT_CIRCULAR_MAX;
         sfree(es->events_circular[es->circular_first]);
-        es->events_circular[es->circular_first] = snewn(sizeof(".."), char);
-        strcpy(es->events_circular[es->circular_first], "..");
-        es->events_circular[es->circular_first][sizeof("..") - 1] = '\0';
+        es->events_circular[es->circular_first] = dupstr("..");
     }
 }
 
