@@ -791,6 +791,7 @@ struct ssh_tag {
     const struct ssh_kex *kex;
     const struct ssh_signkey *hostkey;
     char *hostkey_str; /* string representation, for easy checking in rekeys */
+    int warned; /* Did initial handshake use warned algorithms */
     unsigned char v2_session_id[SSH2_KEX_MAX_HASH_LEN];
     int v2_session_id_len;
     void *kex_ctx;
@@ -7419,6 +7420,8 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * subsequent rekeys.
          */
         ssh->hostkey_str = s->keystr;
+        ssh->warned =
+            s->warn_kex | s->warn_hk | s->warn_cscipher | s->warn_sccipher;
     } else if (ssh->cross_certifying) {
         s->fingerprint = ssh2_fingerprint(ssh->hostkey, s->hkey);
         logevent("Storing additional host key for this host:");
@@ -7441,9 +7444,10 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * new key.
          */
         s->keystr = ssh->hostkey->fmtkey(s->hkey);
-        if (strcmp(ssh->hostkey_str, s->keystr)) {
+        if (!ssh->warned && strcmp(ssh->hostkey_str, s->keystr)) {
 #ifndef FUZZING
-            logeventf(ssh, "Host key was different in repeat key exchange");
+            store_host_key(ssh->savedhost, ssh->savedport,
+                           ssh->hostkey->keytype, s->keystr);
             sfree(ssh->hostkey_str);
             ssh->hostkey_str = s->keystr;
 #endif
@@ -11222,6 +11226,7 @@ static const char *ssh_init(void *frontend_handle, void **backend_handle,
     ssh->kex_ctx = NULL;
     ssh->hostkey = NULL;
     ssh->hostkey_str = NULL;
+    ssh->warned = 0;
     ssh->exitcode = -1;
     ssh->close_expected = FALSE;
     ssh->clean_exit = FALSE;
