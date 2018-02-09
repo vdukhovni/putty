@@ -6538,62 +6538,54 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 		alg->u.kex.warn = warn;
 	    }
 	}
-	/* List server host key algorithms. */
-        if (!s->got_session_id) {
-            /*
-             * In the first key exchange, we list all the algorithms
-             * we're prepared to cope with, but prefer those algorithms
-	     * for which we have a host key for this host.
-             *
-             * If the host key algorithm is below the warning
-             * threshold, we warn even if we did already have a key
-             * for it, on the basis that if the user has just
-             * reconfigured that host key type to be warned about,
-             * they surely _do_ want to be alerted that a server
-             * they're actually connecting to is using it.
-             */
-            warn = FALSE;
-            for (i = 0; i < s->n_preferred_hk; i++) {
-                if (s->preferred_hk[i] == HK_WARN)
-                    warn = TRUE;
-                for (j = 0; j < lenof(hostkey_algs); j++) {
-                    if (hostkey_algs[j].id != s->preferred_hk[i])
-                        continue;
-                    if (have_ssh_host_key(ssh->savedhost, ssh->savedport,
-                                          hostkey_algs[j].alg->keytype)) {
-                        alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
-                                                  hostkey_algs[j].alg->name);
-                        alg->u.hk.hostkey = hostkey_algs[j].alg;
-                        alg->u.hk.warn = warn;
-                    }
-                }
-	    }
-            warn = FALSE;
-            for (i = 0; i < s->n_preferred_hk; i++) {
-                if (s->preferred_hk[i] == HK_WARN)
-                    warn = TRUE;
-                for (j = 0; j < lenof(hostkey_algs); j++) {
-                    if (hostkey_algs[j].id != s->preferred_hk[i])
-                        continue;
+	/*
+         * List server host key algorithms.
+         *
+         * On initial key exchange we prefer those algorithms for which we have
+         * a host key for this host.  On rekeys we allow host key upgrades
+         * without prompting since the host is already authenticated.  This
+         * makes it possible to smoothly transition to stronger host keys.
+         *
+         * Note: On initial kex if warned, don't later silently store new host
+         * keys.
+         *
+         * If the host key algorithm is below the warning threshold, we warn
+         * even if we did already have a key for it, on the basis that if the
+         * user has just reconfigured that host key type to be warned about,
+         * they surely _do_ want to be alerted that a server they're actually
+         * connecting to is using it.
+         *
+         * Note: there's no need to warn about hostkey algorithms when
+         * rekeying, the initial host authentication is sufficient.
+         */
+        warn = FALSE;
+        for (i = 0; i < s->n_preferred_hk && !s->got_session_id; i++) {
+            if (s->preferred_hk[i] == HK_WARN)
+                warn = TRUE;
+            for (j = 0; j < lenof(hostkey_algs); j++) {
+                if (hostkey_algs[j].id != s->preferred_hk[i])
+                    continue;
+                if (have_ssh_host_key(ssh->savedhost, ssh->savedport,
+                                      hostkey_algs[j].alg->keytype)) {
                     alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
                                               hostkey_algs[j].alg->name);
                     alg->u.hk.hostkey = hostkey_algs[j].alg;
                     alg->u.hk.warn = warn;
                 }
             }
-        } else {
-            /*
-             * In subsequent key exchanges, we list only the kex
-             * algorithm that was selected in the first key exchange,
-             * so that we keep getting the same host key and hence
-             * don't have to interrupt the user's session to ask for
-             * reverification.
-             */
-            assert(ssh->kex);
-	    alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
-				      ssh->hostkey->name);
-	    alg->u.hk.hostkey = ssh->hostkey;
-            alg->u.hk.warn = FALSE;
+        }
+        warn = FALSE;
+        for (i = 0; i < s->n_preferred_hk; i++) {
+            if (s->preferred_hk[i] == HK_WARN && !s->got_session_id)
+                warn = TRUE;
+            for (j = 0; j < lenof(hostkey_algs); j++) {
+                if (hostkey_algs[j].id != s->preferred_hk[i])
+                    continue;
+                alg = ssh2_kexinit_addalg(s->kexlists[KEXLIST_HOSTKEY],
+                                          hostkey_algs[j].alg->name);
+                alg->u.hk.hostkey = hostkey_algs[j].alg;
+                alg->u.hk.warn = warn;
+            }
         }
 	/* List encryption algorithms (client->server then server->client). */
 	for (k = KEXLIST_CSCIPHER; k <= KEXLIST_SCCIPHER; k++) {
