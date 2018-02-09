@@ -7431,21 +7431,25 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
          * Don't forget to store the new key as the one we'll be
          * re-checking in future normal rekeys.
          */
+        sfree(ssh->hostkey_str);
         ssh->hostkey_str = s->keystr;
     } else {
         /*
-         * In a rekey, we never present an interactive host key
-         * verification request to the user. Instead, we simply
-         * enforce that the key we're seeing this time is identical to
-         * the one we saw before.
+         * We do not care if the server changes host keys, however, if the
+         * initial key was strongly authenticated with non-warning algorithms
+         * (not definitively knowable with GSSKEYEX), then we should store the
+         * new key.
          */
+        s->keystr = ssh->hostkey->fmtkey(s->hkey);
         if (strcmp(ssh->hostkey_str, s->keystr)) {
 #ifndef FUZZING
-            bombout(("Host key was different in repeat key exchange"));
-            crStopV;
+            logeventf(ssh, "Host key was different in repeat key exchange");
+            sfree(ssh->hostkey_str);
+            ssh->hostkey_str = s->keystr;
 #endif
+        } else {
+            sfree(s->keystr);
         }
-        sfree(s->keystr);
     }
     ssh->hostkey->freekey(s->hkey);
 
