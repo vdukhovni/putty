@@ -6718,6 +6718,8 @@ static void do_ssh2_transport(Ssh ssh, const void *vin, int inlen,
 		bombout(("KEXINIT packet was incomplete"));
 		crStopV;
 	    }
+            logeventf(ssh, "Server offered these %s algorithms: %.*s",
+                      kexlist_descr[i], len, str);
 
             /* If we've already selected a cipher which requires a
              * particular MAC, then just select that, and don't even
